@@ -9,11 +9,70 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
+from pytorch_lightning.callbacks import ModelCheckpoint  # ← 新增
+
 from fdiff.dataloaders.datamodules import Datamodule
 from fdiff.models.score_models import ScoreModule
 from fdiff.utils.callbacks import SamplingCallback
 from fdiff.utils.extraction import dict_to_str, get_training_params
 from fdiff.utils.wandb import maybe_initialize_wandb
+
+# --- safe instantiate helpers ---
+from pydoc import locate
+from hydra.utils import instantiate as _hydra_instantiate
+from typing import Any
+
+
+def _build_datamodule(cfg: DictConfig) -> Any:
+    dm_cfg = cfg.datamodule
+    PASS_KEYS = (
+        "data_dir", "batch_size", "window_length", "pred_len", "stride",
+        "standardize", "fourier_transform",
+        "num_workers", "pin_memory", "val_ratio",
+        "jsonl_train", "jsonl_test",
+    )
+
+    # 1) Hydra 原生 _target_
+    if isinstance(dm_cfg, DictConfig) and "_target_" in dm_cfg:
+        return _hydra_instantiate(dm_cfg)
+
+    # 2) 形如 {datamodule: "<类路径>", 其他参数...}
+    if isinstance(dm_cfg, DictConfig) and "datamodule" in dm_cfg:
+        inner = dm_cfg.get("datamodule")
+        if isinstance(inner, DictConfig) and "_target_" in inner:
+            return _hydra_instantiate(inner)
+        if isinstance(inner, str):
+            cls = locate(inner)
+            if cls is None:
+                raise RuntimeError(f"Cannot locate datamodule class: {inner}")
+            params = {}
+            for k in PASS_KEYS:
+                if k in dm_cfg:
+                    params[k] = dm_cfg.get(k)
+                elif k in cfg:
+                    params[k] = cfg.get(k)
+            return cls(**params)
+
+    # 3) 纯类路径字符串
+    if isinstance(dm_cfg, str):
+        cls = locate(dm_cfg)
+        if cls is None:
+            raise RuntimeError(f"Cannot locate datamodule class: {dm_cfg}")
+        params = {}
+        for k in PASS_KEYS:
+            if k in cfg:
+                params[k] = cfg.get(k)
+        return cls(**params)
+
+    # 4) 尝试旧工厂（向后兼容）
+    try:
+        from fdiff.dataloaders.datamodules import Datamodule as _Factory
+        return _Factory(cfg)
+    except Exception:
+        pass
+
+    # 5) 兜底
+    return dm_cfg
 
 
 class TrainingRunner:
@@ -34,13 +93,35 @@ class TrainingRunner:
         # Instantiate all the components
         self.score_model: ScoreModule = instantiate(cfg.score_model)
         self.trainer: pl.Trainer = instantiate(cfg.trainer)
-        self.datamodule: Datamodule = instantiate(cfg.datamodule)
+        self.datamodule: Datamodule = _build_datamodule(cfg)
+        logging.info(f"[debug] datamodule instance type: {type(self.datamodule)}")
 
-        # Save the config to the log directory
-        save_dir = Path.cwd() / "lightning_logs" / run_id
-        os.makedirs(save_dir, exist_ok=True)
-        logging.info(f"Saving the config into {save_dir}.")
-        OmegaConf.save(config=cfg, f=save_dir / "train_config.yaml")
+        # ---- 取 W&B 的真实 run id（在线时覆盖 offline-xxxx）----
+        wb_id = None
+        loggers = self.trainer.logger if isinstance(self.trainer.logger, (list, tuple)) else [self.trainer.logger]
+        for lg in loggers:
+            try:
+                exp = getattr(lg, "experiment", None)  # WandbLogger.experiment -> wandb.Run
+                if exp is not None and getattr(exp, "id", None):
+                    wb_id = exp.id
+                    break
+            except Exception:
+                pass
+        if wb_id:
+            run_id = wb_id
+
+        # ---- 保存目录：支持 FDIFF_LOG_DIR 环境变量 ----
+        log_root = Path(os.environ.get("FDIFF_LOG_DIR", str(Path.cwd() / "lightning_logs")))
+        self.save_dir = log_root / run_id
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Saving the config into {self.save_dir}.")
+        OmegaConf.save(config=cfg, f=self.save_dir / "train_config.yaml")
+
+        # ---- 强制 ModelCheckpoint 把 ckpt 写到同一处 ----
+        for cb in getattr(self.trainer, "callbacks", []):
+            if isinstance(cb, ModelCheckpoint):
+                cb.dirpath = str(self.save_dir / "checkpoints")
+                os.makedirs(cb.dirpath, exist_ok=True)
 
         # Set-up dataset
         self.datamodule.prepare_data()

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 import os
 from abc import ABC, abstractmethod, abstractproperty
@@ -548,3 +549,212 @@ class USDroughtsDatamodule(Datamodule):
     @property
     def dataset_name(self) -> str:
         return "droughts"
+
+# ==== [BEGIN] GluonTSJsonDatamodule (append this block to the end of file) ====
+import json, gzip
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
+
+
+def _fdj_resolve_split_file(root: Path, split: str) -> Path:
+    """
+    依次尝试以下候选（命中即返回）：
+      <root>/<split>.json
+      <root>/<split>/<split>.json
+      <root>/<split>/data.json
+      <root>/<split>/data.json.gz
+    """
+    cands = [
+        root / f"{split}.json",
+        root / split / f"{split}.json",
+        root / split / "data.json",
+        root / split / "data.json.gz",
+    ]
+    for p in cands:
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"[GluonTSJsonDatamodule] 找不到 {split} 集：期望之一 {cands}")
+
+
+def _fdj_iter_jsonl(path: Path):
+    """逐行读取 JSONL（同时支持 .gz）"""
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+    else:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+
+
+def _fdj_load_gluonts_like(path: Path) -> np.ndarray:
+    """
+    读取 GluonTS JSONL，返回 (T, A)：
+    - 每行一个 series，字段 'target' 为序列
+    - 对齐到最短长度，并按末端对齐
+    """
+    series: List[List[float]] = []
+    for obj in _fdj_iter_jsonl(path):
+        tgt = obj.get("target", None)
+        if tgt is None:
+            raise ValueError(f"{path}: 缺少 'target' 字段")
+        series.append(list(map(float, tgt)))
+
+    if not series:
+        raise ValueError(f"{path}: 空数据")
+
+    min_len = min(len(s) for s in series)
+    series = [s[-min_len:] for s in series]
+    arr = np.stack(series, axis=1)  # (T, A)
+    return arr.astype(np.float32, copy=False)
+
+
+def _fdj_build_windows(X: np.ndarray, L: int, stride: int) -> np.ndarray:
+    """(T, A) -> (N, L, A) 滑窗"""
+    T, A = X.shape
+    if T < L:
+        raise ValueError(f"时间长度 T={T} < 窗口长度 L={L}")
+    idx = []
+    t = 0
+    while t + L <= T:
+        idx.append((t, t + L))
+        t += stride
+    return np.stack([X[s:e, :] for (s, e) in idx], axis=0).astype(np.float32, copy=False)
+
+
+class _FDJWindowedDataset(Dataset):
+    def __init__(self, windows: np.ndarray):
+        self.windows = windows  # (N, L, A) float32
+
+    def __len__(self): return self.windows.shape[0]
+    def __getitem__(self, i): return self.windows[i]
+
+
+class GluonTSJsonDatamodule(pl.LightningDataModule):
+    """
+    读取你的 GluonTS 数据目录（含 metadata.json、train/test 子目录）。
+    自动识别 train.json / train/data.json(.gz) 与 test 同理。
+    - 标准化：按资产（用 train 的均值/方差）
+    - 输出：训练/验证/测试 DataLoader（样本为窗口 (L, A)）
+    """
+    def __init__(
+        self,
+        data_dir: str,
+        batch_size: int = 64,
+        window_length: int = 360,
+        pred_len: int = 30,
+        stride: int = 1,
+        val_ratio: float = 0.1,
+        standardize: bool = True,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+        # 手动指定文件时将覆盖自动探测
+        jsonl_train: Optional[str] = None,
+        jsonl_test: Optional[str] = None,
+    ):
+        super().__init__()
+        self.data_dir = Path(data_dir)
+        self.batch_size = int(batch_size)
+        self.window_length = int(window_length)
+        self.pred_len = int(pred_len)
+        self.stride = int(stride)
+        self.val_ratio = float(val_ratio)
+        self.standardize = bool(standardize)
+        self.num_workers = int(num_workers)
+        self.pin_memory = bool(pin_memory)
+
+        self.jsonl_train = Path(jsonl_train) if jsonl_train else None
+        self.jsonl_test  = Path(jsonl_test)  if jsonl_test  else None
+
+        self._mean: Optional[np.ndarray] = None
+        self._std: Optional[np.ndarray]  = None
+
+        self.ds_train: Optional[Dataset] = None
+        self.ds_val:   Optional[Dataset] = None
+        self.ds_test:  Optional[Dataset] = None
+
+    def prepare_data(self):
+        root = self.data_dir
+        if not root.exists():
+            raise FileNotFoundError(f"data_dir 不存在：{root}")
+
+        # 自动探测 train/test
+        if self.jsonl_train is None:
+            self.jsonl_train = _fdj_resolve_split_file(root, "train")
+        if self.jsonl_test is None:
+            try:
+                self.jsonl_test = _fdj_resolve_split_file(root, "test")
+            except FileNotFoundError:
+                self.jsonl_test = None
+
+    def setup(self, stage: Optional[str] = None):
+        assert self.jsonl_train is not None
+        Xtr = _fdj_load_gluonts_like(self.jsonl_train)  # (Ttr, A)
+        Atr = Xtr.shape[1]
+        Xt = None
+        if self.jsonl_test is not None:
+            Xt = _fdj_load_gluonts_like(self.jsonl_test)  # (Tte, A)
+            if Xt.shape[1] != Atr:
+                raise ValueError(f"train/test 资产数不一致: {Atr} vs {Xt.shape[1]}")
+
+        # 标准化（按资产）
+        if self.standardize:
+            mu = Xtr.mean(axis=0)
+            sigma = Xtr.std(axis=0, ddof=1)
+            sigma[sigma < 1e-8] = 1.0
+            self._mean, self._std = mu, sigma
+            Xtr = (Xtr - mu) / sigma
+            if Xt is not None:
+                Xt = (Xt - mu) / sigma
+
+        # 滑窗
+        win_tr = _fdj_build_windows(Xtr, self.window_length, self.stride)  # (Ntr, L, A)
+        ntr = win_tr.shape[0]
+        nval = max(1, int(round(ntr * self.val_ratio)))
+        ntr_keep = max(1, ntr - nval)
+        self.ds_train = _FDJWindowedDataset(win_tr[:ntr_keep])
+        self.ds_val   = _FDJWindowedDataset(win_tr[ntr_keep:]) if nval > 0 else _FDJWindowedDataset(win_tr[:ntr_keep])
+
+        if Xt is not None:
+            win_te = _fdj_build_windows(Xt, self.window_length, self.stride)
+            self.ds_test = _FDJWindowedDataset(win_te)
+        else:
+            self.ds_test = None
+
+        # 记录元信息（有些下游代码可能用到）
+        self.num_assets_ = Atr
+        self.input_length_ = self.window_length
+
+    def train_dataloader(self):
+        return DataLoader(self.ds_train, batch_size=self.batch_size, shuffle=True,
+                          num_workers=self.num_workers, pin_memory=self.pin_memory, drop_last=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.ds_val, batch_size=self.batch_size, shuffle=False,
+                          num_workers=self.num_workers, pin_memory=self.pin_memory, drop_last=False)
+
+    def test_dataloader(self):
+        if self.ds_test is None:
+            return None
+        return DataLoader(self.ds_test, batch_size=self.batch_size, shuffle=False,
+                          num_workers=self.num_workers, pin_memory=self.pin_memory, drop_last=False)
+
+
+# 若文件里维护了 __all__，把新类名加进去；若没有 __all__ 则无事发生
+try:
+    __all__ = list(__all__)  # type: ignore  # 可能不存在
+    if "GluonTSJsonDatamodule" not in __all__:
+        __all__.append("GluonTSJsonDatamodule")
+except NameError:
+    __all__ = ["GluonTSJsonDatamodule"]
+# ==== [END] GluonTSJsonDatamodule ====

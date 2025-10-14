@@ -5,7 +5,7 @@
   auto_insert_metric_name: false
 - _target_: fdiff.utils.callbacks.SamplingCallback
   every_n_epochs: 10
-  sample_batch_size: ${datamodule.batch_size}
+  sample_batch_size: ${sampler.sample_batch_size}
   num_samples: 200
   num_diffusion_steps: 1000
   metrics:

@@ -1,13 +1,18 @@
-datamodule:
-  _target_: fdiff.dataloaders.datamodules.GluonTSJsonDatamodule
-  data_dir: ${oc.env:FDIFF_DATA_DIR,""}   # 没设环境变量就给空串，后续 prepare_data 会报更友好的错误
-  batch_size: 64
-  window_length: 360
-  pred_len: 30
-  stride: 1
-  standardize: true
-  num_workers: 4
-  pin_memory: true
-  val_ratio: 0.1
-  jsonl_train:
-  jsonl_test:
+# external/FourierDiffusion/cmd/conf/datamodule/gluonts_json.yaml
+# 与其它数据集保持一致：datamodule 用类路径字符串，超参在根层
+datamodule: fdiff.dataloaders.datamodules.GluonTSJsonDatamodule
+
+# 根层参数（声明出来后，CLI 可以直接覆盖而不会触发 struct 错误）
+data_dir: ${oc.env:FDIFF_DATA_DIR,""}
+batch_size: 64
+window_length: 360
+pred_len: 30
+stride: 1
+standardize: true
+num_workers: 4
+pin_memory: true
+val_ratio: 0.1
+
+# 可选：显式声明（需要时可在 CLI 覆盖为具体路径）
+jsonl_train:
+jsonl_test:

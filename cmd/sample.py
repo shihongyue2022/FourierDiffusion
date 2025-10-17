@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 from pathlib import Path
 from typing import Any
 
@@ -218,6 +219,14 @@ class SamplingRunner:
             stream=open(self.save_dir / "results.yaml", "w"),
         )
         torch.save(X, self.save_dir / "samples.pt")
+
+        # 保存多种兼容格式，便于后续协方差与点预测分析
+        samples_np = X.detach().cpu().numpy()
+        np.save(self.save_dir / "samples.npy", samples_np)  # (S, L, A)
+        np.save(self.save_dir / "samples_ast.npy", samples_np.transpose(2, 0, 1))  # (A, S, L)
+        pred_time = samples_np.mean(axis=0).T  # (A, L)
+        np.save(self.save_dir / "pred_time.npy", pred_time)
+        logging.info("Saved samples.pt/.npy 和 pred_time.npy 至 %s", self.save_dir)
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="sample")

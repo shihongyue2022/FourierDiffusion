@@ -4,7 +4,7 @@
   filename: "epoch={epoch}-val_loss={val/loss:.2f}"
   auto_insert_metric_name: false
 - _target_: fdiff.utils.callbacks.SamplingCallback
-  every_n_epochs: 10
+  every_n_epochs: 1
   sample_batch_size: ${sampler.sample_batch_size}
   num_samples: 200
   num_diffusion_steps: 1000

@@ -1,3 +1,10 @@
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
 import pytorch_lightning as pl
 import torch
 
@@ -5,6 +12,8 @@ from fdiff.dataloaders.datamodules import Datamodule
 from fdiff.models.score_models import ScoreModule
 from fdiff.sampling.metrics import Metric, MetricCollection
 from fdiff.sampling.sampler import DiffusionSampler
+
+from typing import Optional
 
 from .fourier import idft
 
@@ -26,6 +35,32 @@ class SamplingCallback(pl.Callback):
         self.metrics = metrics
         self.datamodule_initialized = False
 
+        self.probe_enabled = os.getenv("FDIFF_PROBE_ENABLE", "").lower() in {"1", "true", "yes"}
+        self.probe_script = None
+        self.probe_out_root_env = os.getenv("FDIFF_PROBE_OUTDIR")
+        self.probe_truth_jsonl = os.getenv("FDIFF_PROBE_TRUTH_JSONL")
+        self.probe_truth_npy = os.getenv("FDIFF_PROBE_TRUTH_NPY")
+        self.probe_truth_csv = os.getenv("FDIFF_PROBE_TRUTH_CSV")
+        self.probe_dir_env = os.getenv("FDIFF_PROBE_DIR")
+        self.probe_eval_dir_env = os.getenv("FDIFF_PROBE_EVAL_DIR")
+        self.probe_tag_base = os.getenv("FDIFF_PROBE_TAG")
+        self.probe_every = int(os.getenv("FDIFF_PROBE_EVERY", str(self.every_n_epochs)))
+        self._run_dir: Optional[Path] = None
+        self._last_sample_elapsed: float = 0.0
+
+        if self.probe_enabled:
+            script_env = os.getenv("FDIFF_PROBE_SCRIPT")
+            if script_env:
+                script_path = Path(script_env).expanduser().resolve()
+                if script_path.exists():
+                    self.probe_script = script_path
+                else:
+                    print(f"[probe] 指定的 FDIFF_PROBE_SCRIPT 不存在：{script_path}")
+                    self.probe_enabled = False
+            else:
+                print("[probe] FDIFF_PROBE_SCRIPT 未设置，已禁用探针")
+                self.probe_enabled = False
+
     def setup_datamodule(self, datamodule: Datamodule) -> None:
         # Exract the necessary information from the datamodule
         self.standardize = datamodule.standardize
@@ -44,45 +79,110 @@ class SamplingCallback(pl.Callback):
             score_model=pl_module,
             sample_batch_size=self.sample_batch_size,
         )
+        if self.probe_enabled:
+            log_dir = getattr(trainer.logger, "log_dir", None)
+            if log_dir is not None:
+                self._run_dir = Path(log_dir).expanduser()
+            else:
+                self._run_dir = Path.cwd() / "lightning_logs"
+        else:
+            self._run_dir = None
 
     def on_train_epoch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule
     ) -> None:
-        if (
-            trainer.current_epoch % self.every_n_epochs == 0
-            or trainer.current_epoch + 1 == trainer.max_epochs
-        ):
-            # Sample from score model
-            X = self.sample()
+        max_epochs = getattr(trainer, "max_epochs", None)
+        is_last_epoch = max_epochs is not None and (trainer.current_epoch + 1 == max_epochs)
+        should_sample = (
+            trainer.current_epoch % self.every_n_epochs == 0 or is_last_epoch
+        )
+        if not should_sample:
+            return
 
-            # Compute metrics
-            results = self.metric_collection(X)
+        X = self.sample()
 
-            # Add a metrics/ suffix to the keys in results
-            results = {f"metrics/{key}": value for key, value in results.items()}
+        # Compute metrics
+        results = self.metric_collection(X)
 
-            # Log metrics
-            pl_module.log_dict(results, on_step=False, on_epoch=True)
+        # Add a metrics/ suffix to the keys in results
+        results = {f"metrics/{key}": value for key, value in results.items()}
+
+        # Log metrics
+        pl_module.log_dict(results, on_step=False, on_epoch=True)
+        self._maybe_run_probe(trainer, X)
+
+    def _maybe_run_probe(self, trainer: pl.Trainer, samples_tensor: torch.Tensor) -> None:
+        if not self.probe_enabled or self.probe_script is None:
+            return
+        epoch = trainer.current_epoch + 1
+        if epoch % self.probe_every != 0 and (trainer.max_epochs is None or epoch != getattr(trainer, "max_epochs", None)):
+            return
+
+        run_dir = self._run_dir or Path.cwd() / "lightning_logs"
+        epoch_dir = run_dir / f"probe_epoch_{epoch:04d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+
+        samples_np = samples_tensor.detach().cpu().numpy()
+        np.save(epoch_dir / "samples.npy", samples_np)
+
+        pred_len = samples_np.shape[1]
+        num_assets = samples_np.shape[2]
+        num_samples = samples_np.shape[0]
+
+        probe_out = (Path(self.probe_out_root_env).expanduser().resolve()
+                     if self.probe_out_root_env else run_dir.parent / "covcmp_fourier")
+        cmd = [
+            sys.executable,
+            str(self.probe_script),
+            "--fdiff_logs", str(epoch_dir),
+            "--outdir", str(probe_out),
+            "--pred_len", str(pred_len),
+            "--num_assets", str(num_assets),
+            "--num_samples", str(num_samples),
+            "--timing_sample", str(self._last_sample_elapsed),
+            "--probe_enable",
+            "--probe_epochs", str(epoch),
+        ]
+        if self.probe_truth_jsonl:
+            cmd.extend(["--truth_jsonl", self.probe_truth_jsonl])
+        if self.probe_truth_npy:
+            cmd.extend(["--truth_npy", self.probe_truth_npy])
+        if self.probe_truth_csv:
+            cmd.extend(["--truth_csv", self.probe_truth_csv])
+        if self.probe_dir_env:
+            cmd.extend(["--probe_dir", self.probe_dir_env])
+        if self.probe_eval_dir_env:
+            cmd.extend(["--probe_eval_dir", self.probe_eval_dir_env])
+        if self.probe_tag_base:
+            cmd.extend(["--probe_tag", f"{self.probe_tag_base}_epoch{epoch:04d}"])
+
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"[probe] cov_compare_FourierDiffusion 执行失败: {exc}")
+        except FileNotFoundError as exc:
+            print(f"[probe] cov_compare_FourierDiffusion 不可用: {exc}")
+        except Exception as exc:
+            print(f"[probe] cov_compare_FourierDiffusion 出现异常: {exc}")
+
 
     def sample(self) -> torch.Tensor:
-        # Check that the dqtqmodule is initialized
+        # Check that the datamodule is initialized
         assert self.datamodule_initialized, (
             "The datamodule has not been initialized. "
             "Please call `setup_datamodule` before sampling."
         )
 
-        # Sample from score model
-
+        start = time.perf_counter()
         X = self.sampler.sample(
             num_samples=self.num_samples,
             num_diffusion_steps=self.num_diffusion_steps,
         )
+        self._last_sample_elapsed = time.perf_counter() - start
 
-        # Map to the original scale if the input was standardized
         if self.standardize:
             X = X * self.feature_std + self.feature_mean
 
-        # If sampling in frequency domain, bring back the sample to time domain
         if self.fourier_transform:
             X = idft(X)
         assert isinstance(X, torch.Tensor)

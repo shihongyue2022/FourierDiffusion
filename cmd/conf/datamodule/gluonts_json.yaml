@@ -3,7 +3,7 @@ datamodule: fdiff.dataloaders.datamodules.GluonTSJsonDatamodule
 
 data_dir: ${oc.env:FDIFF_DATA_DIR,""}
 batch_size: 64
-window_length: 200
+window_length: 60
 pred_len: 30
 stride: 1
 standardize: true

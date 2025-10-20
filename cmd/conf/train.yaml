@@ -7,3 +7,4 @@ defaults:
   - score_model: default
   - datamodule: ecg
   - trainer: default
+  - probe: default

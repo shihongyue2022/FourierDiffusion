@@ -1,0 +1,11 @@
+# Configuration for SamplingCallback probe integration
+enable: false
+script: null
+truth_jsonl: null
+truth_npy: null
+truth_csv: null
+outdir: null
+probe_dir: null
+probe_eval_dir: null
+tag: null
+every: null

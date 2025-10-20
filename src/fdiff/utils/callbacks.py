@@ -35,31 +35,109 @@ class SamplingCallback(pl.Callback):
         self.metrics = metrics
         self.datamodule_initialized = False
 
-        self.probe_enabled = os.getenv("FDIFF_PROBE_ENABLE", "").lower() in {"1", "true", "yes"}
-        self.probe_script = None
-        self.probe_out_root_env = os.getenv("FDIFF_PROBE_OUTDIR")
-        self.probe_truth_jsonl = os.getenv("FDIFF_PROBE_TRUTH_JSONL")
-        self.probe_truth_npy = os.getenv("FDIFF_PROBE_TRUTH_NPY")
-        self.probe_truth_csv = os.getenv("FDIFF_PROBE_TRUTH_CSV")
-        self.probe_dir_env = os.getenv("FDIFF_PROBE_DIR")
-        self.probe_eval_dir_env = os.getenv("FDIFF_PROBE_EVAL_DIR")
-        self.probe_tag_base = os.getenv("FDIFF_PROBE_TAG")
-        self.probe_every = int(os.getenv("FDIFF_PROBE_EVERY", str(self.every_n_epochs)))
+        self.probe_enabled: bool = False
+        self.probe_script: Optional[Path] = None
+        self.probe_out_root: Optional[Path] = None
+        self.probe_truth_jsonl: Optional[Path] = None
+        self.probe_truth_npy: Optional[Path] = None
+        self.probe_truth_csv: Optional[Path] = None
+        self.probe_dir: Optional[Path] = None
+        self.probe_eval_dir: Optional[Path] = None
+        self.probe_tag_base: Optional[str] = None
+        self.probe_every = self.every_n_epochs
         self._run_dir: Optional[Path] = None
         self._last_sample_elapsed: float = 0.0
 
-        if self.probe_enabled:
-            script_env = os.getenv("FDIFF_PROBE_SCRIPT")
-            if script_env:
-                script_path = Path(script_env).expanduser().resolve()
-                if script_path.exists():
-                    self.probe_script = script_path
-                else:
-                    print(f"[probe] 指定的 FDIFF_PROBE_SCRIPT 不存在：{script_path}")
-                    self.probe_enabled = False
-            else:
-                print("[probe] FDIFF_PROBE_SCRIPT 未设置，已禁用探针")
+        env_enable = os.getenv("FDIFF_PROBE_ENABLE", "").lower() in {"1", "true", "yes"}
+        if env_enable:
+            env_every = os.getenv("FDIFF_PROBE_EVERY")
+            try:
+                self.configure_probe(
+                    enable=True,
+                    script=os.getenv("FDIFF_PROBE_SCRIPT"),
+                    truth_jsonl=os.getenv("FDIFF_PROBE_TRUTH_JSONL"),
+                    truth_npy=os.getenv("FDIFF_PROBE_TRUTH_NPY"),
+                    truth_csv=os.getenv("FDIFF_PROBE_TRUTH_CSV"),
+                    out_root=os.getenv("FDIFF_PROBE_OUTDIR"),
+                    probe_dir=os.getenv("FDIFF_PROBE_DIR"),
+                    probe_eval_dir=os.getenv("FDIFF_PROBE_EVAL_DIR"),
+                    tag=os.getenv("FDIFF_PROBE_TAG"),
+                    every=int(env_every) if env_every else None,
+                )
+            except Exception as exc:
+                print(f"[probe] 环境变量配置探针失败: {exc}")
                 self.probe_enabled = False
+                self.probe_script = None
+
+    def configure_probe(
+        self,
+        *,
+        enable: bool,
+        script: Optional[str] = None,
+        truth_jsonl: Optional[str] = None,
+        truth_npy: Optional[str] = None,
+        truth_csv: Optional[str] = None,
+        out_root: Optional[str] = None,
+        probe_dir: Optional[str] = None,
+        probe_eval_dir: Optional[str] = None,
+        tag: Optional[str] = None,
+        every: Optional[int] = None,
+    ) -> None:
+        """Override probe configuration programmatically."""
+        if not enable:
+            self.probe_enabled = False
+            self.probe_script = None
+            self.probe_out_root = None
+            self.probe_truth_jsonl = None
+            self.probe_truth_npy = None
+            self.probe_truth_csv = None
+            self.probe_dir = None
+            self.probe_eval_dir = None
+            self.probe_tag_base = None
+            self.probe_every = self.every_n_epochs
+            return
+
+        script_path = Path(script).expanduser().resolve() if script else None
+        if script_path is None:
+            raise ValueError("probe script must be provided when enable=True")
+        if not script_path.exists():
+            raise FileNotFoundError(f"probe script not found: {script_path}")
+
+        def _opt_path(value: Optional[str]) -> Optional[Path]:
+            if value:
+                return Path(value).expanduser().resolve()
+            return None
+
+        truth_jsonl_path = _opt_path(truth_jsonl)
+        if truth_jsonl_path and not truth_jsonl_path.exists():
+            raise FileNotFoundError(f"truth_jsonl not found: {truth_jsonl_path}")
+
+        truth_npy_path = _opt_path(truth_npy)
+        if truth_npy_path and not truth_npy_path.exists():
+            raise FileNotFoundError(f"truth_npy not found: {truth_npy_path}")
+
+        truth_csv_path = _opt_path(truth_csv)
+        if truth_csv_path and not truth_csv_path.exists():
+            raise FileNotFoundError(f"truth_csv not found: {truth_csv_path}")
+
+        out_root_path = _opt_path(out_root)
+        probe_dir_path = _opt_path(probe_dir)
+        probe_eval_dir_path = _opt_path(probe_eval_dir)
+
+        if every is not None and every <= 0:
+            raise ValueError("probe 'every' must be positive when provided")
+
+        self.probe_enabled = True
+        self.probe_script = script_path
+        self.probe_out_root = out_root_path
+        self.probe_truth_jsonl = truth_jsonl_path
+        self.probe_truth_npy = truth_npy_path
+        self.probe_truth_csv = truth_csv_path
+        self.probe_dir = probe_dir_path
+        self.probe_eval_dir = probe_eval_dir_path
+        self.probe_tag_base = tag
+        if every is not None:
+            self.probe_every = every
 
     def setup_datamodule(self, datamodule: Datamodule) -> None:
         # Exract the necessary information from the datamodule
@@ -129,8 +207,7 @@ class SamplingCallback(pl.Callback):
         num_assets = samples_np.shape[2]
         num_samples = samples_np.shape[0]
 
-        probe_out = (Path(self.probe_out_root_env).expanduser().resolve()
-                     if self.probe_out_root_env else run_dir.parent / "covcmp_fourier")
+        probe_out = self.probe_out_root or (run_dir.parent / "covcmp_fourier")
         cmd = [
             sys.executable,
             str(self.probe_script),
@@ -144,15 +221,15 @@ class SamplingCallback(pl.Callback):
             "--probe_epochs", str(epoch),
         ]
         if self.probe_truth_jsonl:
-            cmd.extend(["--truth_jsonl", self.probe_truth_jsonl])
+            cmd.extend(["--truth_jsonl", str(self.probe_truth_jsonl)])
         if self.probe_truth_npy:
-            cmd.extend(["--truth_npy", self.probe_truth_npy])
+            cmd.extend(["--truth_npy", str(self.probe_truth_npy)])
         if self.probe_truth_csv:
-            cmd.extend(["--truth_csv", self.probe_truth_csv])
-        if self.probe_dir_env:
-            cmd.extend(["--probe_dir", self.probe_dir_env])
-        if self.probe_eval_dir_env:
-            cmd.extend(["--probe_eval_dir", self.probe_eval_dir_env])
+            cmd.extend(["--truth_csv", str(self.probe_truth_csv)])
+        if self.probe_dir:
+            cmd.extend(["--probe_dir", str(self.probe_dir)])
+        if self.probe_eval_dir:
+            cmd.extend(["--probe_eval_dir", str(self.probe_eval_dir)])
         if self.probe_tag_base:
             cmd.extend(["--probe_tag", f"{self.probe_tag_base}_epoch{epoch:04d}"])
 

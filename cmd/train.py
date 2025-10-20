@@ -118,6 +118,42 @@ class TrainingRunner:
         OmegaConf.save(config=cfg, f=self.save_dir / "train_config.yaml")
 
         # ---- 强制 ModelCheckpoint 把 ckpt 写到同一处 ----
+        # Configure probe callback (optional)
+        probe_cfg_dict = None
+        if "probe" in cfg and cfg.probe is not None:
+            probe_cfg_dict = OmegaConf.to_container(cfg.probe, resolve=True)
+        if probe_cfg_dict is not None:
+            enable = bool(probe_cfg_dict.get("enable", False))
+            script_val = probe_cfg_dict.get("script")
+            if enable and not script_val:
+                default_script = Path(__file__).with_name("cov_compare_FourierDiffusion.py")
+                if default_script.exists():
+                    script_val = str(default_script)
+                else:
+                    raise FileNotFoundError("probe.enable=true 但未提供 probe.script，且默认脚本不存在")
+            truth_jsonl = probe_cfg_dict.get("truth_jsonl")
+            truth_npy = probe_cfg_dict.get("truth_npy")
+            truth_csv = probe_cfg_dict.get("truth_csv")
+            outdir = probe_cfg_dict.get("outdir")
+            probe_dir = probe_cfg_dict.get("probe_dir")
+            probe_eval_dir = probe_cfg_dict.get("probe_eval_dir")
+            tag = probe_cfg_dict.get("tag")
+            every = probe_cfg_dict.get("every")
+            for cb in getattr(self.trainer, "callbacks", []):
+                if isinstance(cb, SamplingCallback):
+                    cb.configure_probe(
+                        enable=enable,
+                        script=script_val,
+                        truth_jsonl=truth_jsonl,
+                        truth_npy=truth_npy,
+                        truth_csv=truth_csv,
+                        out_root=outdir,
+                        probe_dir=probe_dir,
+                        probe_eval_dir=probe_eval_dir,
+                        tag=tag,
+                        every=every,
+                    )
+
         for cb in getattr(self.trainer, "callbacks", []):
             if isinstance(cb, ModelCheckpoint):
                 cb.dirpath = str(self.save_dir / "checkpoints")

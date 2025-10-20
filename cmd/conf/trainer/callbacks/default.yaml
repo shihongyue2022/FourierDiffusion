@@ -8,6 +8,7 @@
   sample_batch_size: ${sampler.sample_batch_size}
   num_samples: 200
   num_diffusion_steps: 1000
+  reference_set: test
   metrics:
     - _target_: fdiff.sampling.metrics.SlicedWasserstein
       _partial_: true
@@ -16,3 +17,7 @@
     - _target_: fdiff.sampling.metrics.MarginalWasserstein
       _partial_: true
       random_seed: ${random_seed}
+    - _target_: fdiff.sampling.metrics.CovarianceDifference
+      _partial_: true
+      ddof: 1
+      include_correlation: true

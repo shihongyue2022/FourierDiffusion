@@ -215,3 +215,62 @@ class MarginalWasserstein(Metric):
     @property
     def name(self) -> str:
         return "marginal_wasserstein"
+
+
+class CovarianceDifference(Metric):
+    def __init__(
+        self,
+        original_samples: np.ndarray | torch.Tensor,
+        ddof: int = 1,
+        include_correlation: bool = True,
+    ) -> None:
+        super().__init__(original_samples=original_samples)
+        self.ddof = ddof
+        self.include_correlation = include_correlation
+        self._reference_cov = self._covariance(self.original_samples)
+        self._reference_var = np.diag(self._reference_cov)
+        if self.include_correlation:
+            self._reference_corr = self._correlation(self.original_samples)
+
+    def _covariance(self, samples: np.ndarray | torch.Tensor) -> np.ndarray:
+        flat = check_flat_array(samples)
+        if flat.shape[0] <= 1:
+            raise ValueError(
+                "Covariance requires at least two samples; got fewer in reference or generated data."
+            )
+        cov = np.cov(flat, rowvar=False, ddof=self.ddof)
+        assert isinstance(cov, np.ndarray)
+        return cov
+
+    def _correlation(self, samples: np.ndarray | torch.Tensor) -> np.ndarray:
+        flat = check_flat_array(samples)
+        if flat.shape[0] <= 1:
+            raise ValueError(
+                "Correlation requires at least two samples; got fewer in reference or generated data."
+            )
+        corr = np.corrcoef(flat, rowvar=False)
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+        assert isinstance(corr, np.ndarray)
+        return corr
+
+    def __call__(self, other_samples: np.ndarray | torch.Tensor) -> dict[str, Any]:
+        cov_other = self._covariance(other_samples)
+        var_other = np.diag(cov_other)
+        cov_diff = cov_other - self._reference_cov
+        metrics: dict[str, Any] = {
+            "covariance_frobenius": float(np.linalg.norm(cov_diff, ord="fro")),
+            "covariance_mean_abs": float(np.mean(np.abs(cov_diff))),
+            "variance_mean_abs": float(np.mean(np.abs(var_other - self._reference_var))),
+        }
+        if self.include_correlation:
+            corr_other = self._correlation(other_samples)
+            corr_diff = corr_other - self._reference_corr
+            metrics |= {
+                "correlation_frobenius": float(np.linalg.norm(corr_diff, ord="fro")),
+                "correlation_mean_abs": float(np.mean(np.abs(corr_diff))),
+            }
+        return metrics
+
+    @property
+    def name(self) -> str:
+        return "covariance_difference"

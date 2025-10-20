@@ -26,6 +26,7 @@ class SamplingCallback(pl.Callback):
         num_samples: int,
         num_diffusion_steps: int,
         metrics: list[Metric],
+        reference_set: str = "train",
     ) -> None:
         super().__init__()
         self.every_n_epochs = every_n_epochs
@@ -33,6 +34,7 @@ class SamplingCallback(pl.Callback):
         self.num_samples = num_samples
         self.num_diffusion_steps = num_diffusion_steps
         self.metrics = metrics
+        self.reference_set = reference_set
         self.datamodule_initialized = False
 
         self.probe_enabled: bool = False
@@ -144,9 +146,20 @@ class SamplingCallback(pl.Callback):
         self.standardize = datamodule.standardize
         self.fourier_transform = datamodule.fourier_transform
         self.feature_mean, self.feature_std = datamodule.feature_mean_and_std
+        reference_lookup = {
+            "train": datamodule.X_train,
+            "test": datamodule.X_test,
+            "val": datamodule.X_test,
+            "validation": datamodule.X_test,
+        }
+        if self.reference_set not in reference_lookup:
+            raise ValueError(f"Unknown reference_set '{self.reference_set}' for SamplingCallback.")
+        reference_samples = reference_lookup[self.reference_set]
+        if reference_samples.numel() == 0:
+            raise ValueError("Reference samples are empty; ensure the chosen split is prepared before training.")
         self.metric_collection = MetricCollection(
             metrics=self.metrics,
-            original_samples=datamodule.X_train,
+            original_samples=reference_samples,
             include_baselines=False,
         )
         self.datamodule_initialized = True

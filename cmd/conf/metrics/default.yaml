@@ -12,3 +12,7 @@ metrics:
     _partial_: true
     random_seed: ${random_seed}
     save_all_distances: true
+  - _target_: fdiff.sampling.metrics.CovarianceDifference
+    _partial_: true
+    ddof: 1
+    include_correlation: true
